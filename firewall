@@ -1,0 +1,120 @@
+import pandas as pd
+import numpy as np
+import scapy.all as scapy
+import requests
+import logging
+import os
+from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, LabelEncoder
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
+from sklearn.feature_selection import SelectFromModel
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report
+
+# Set up logging to track potential threats
+logging.basicConfig(filename="threat_log.txt", level=logging.INFO, format="%(asctime)s - %(message)s")
+
+# Load datasets for web attack detection
+def load_web_datasets():
+    file_paths = ["/mnt/data/Brute Force -Web.csv", "/mnt/data/Brute Force -XSS.csv"]
+    df_list = []
+    label_encoder = LabelEncoder()
+    
+    for file in file_paths:
+        df = pd.read_csv(file)
+        df["Label"] = label_encoder.fit_transform(df["Label"])
+        df_list.append(df)
+    
+    return pd.concat(df_list, ignore_index=True)
+
+# Load and process DDoS attack data
+def load_ddos_datasets(file_paths):
+    dataframes = [pd.read_csv(file).select_dtypes(include=[np.number]).dropna() for file in file_paths]
+    return pd.concat(dataframes, ignore_index=True) if dataframes else None
+
+# Load datasets for DoS attacks
+def load_dos_datasets():
+    file_paths = ["DoS attacks-GoldenEye.csv", "DoS attacks-Hulk.csv", "DoS attacks-SlowHTTPTest.csv", "DoS attacks-Slowloris.csv"]
+    df_list = [pd.read_csv(file) for file in file_paths]
+    df_all = pd.concat(df_list, ignore_index=True).dropna()
+    
+    encoder = LabelEncoder()
+    df_all['Protocol'] = encoder.fit_transform(df_all['Protocol'])
+    df_all['Label'] = encoder.fit_transform(df_all['Label'])
+    
+    scaler = MinMaxScaler()
+    df_all[['Pkt Size Avg']] = scaler.fit_transform(df_all[['Pkt Size Avg']])
+    
+    return df_all.drop(columns=['Label']), df_all['Label']
+
+# Train a model to detect web attacks
+def train_web_model(df_combined):
+    X, y = df_combined.drop(columns=["Label"]), df_combined["Label"]
+    scaler, selector, model = RobustScaler(), SelectFromModel(RandomForestClassifier(n_estimators=100)), RandomForestClassifier(n_estimators=500)
+    X_scaled, X_train, X_test, y_train, y_test = scaler.fit_transform(X), *train_test_split(X, y, test_size=0.2, random_state=42)
+    selector.fit(X_train, y_train)
+    X_train_selected, X_test_selected = selector.transform(X_train), selector.transform(X_test)
+    model.fit(X_train_selected, y_train)
+    print(f"Web Attack Model Accuracy: {model.score(X_test_selected, y_test) * 100:.2f}%")
+    return scaler, selector, model
+
+# Train a model for DDoS attack detection
+def train_ddos_model(ddos_data):
+    scaler, model = StandardScaler(), IsolationForest(n_estimators=100, contamination=0.01, random_state=42)
+    X_scaled = scaler.fit_transform(ddos_data)
+    X_train, X_test = train_test_split(X_scaled, test_size=0.2, random_state=42)
+    model.fit(X_train)
+    print("DDoS Detection Model Trained")
+    return scaler, model
+
+# Train a classification model for DoS attacks
+def train_dos_model(X, y):
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+    clf.fit(X_train, y_train)
+    y_pred = clf.predict(X_test)
+    print(f"✅ DoS Model Accuracy: {accuracy_score(y_test, y_pred):.2%}")
+    print("Classification Report:\n", classification_report(y_test, y_pred))
+    return clf
+
+# Extract useful information from network packets
+def extract_packet_features(packet):
+    return np.array([packet[scapy.IP].len, packet[scapy.IP].ttl, packet[scapy.IP].id]).reshape(1, -1) if packet.haslayer(scapy.IP) else None
+
+# Analyze incoming network packets for threats
+def analyze_packet(packet, web_scaler, web_selector, web_model, ddos_scaler, ddos_model):
+    features = extract_packet_features(packet)
+    if features is None:
+        return
+    web_features = web_selector.transform(web_scaler.transform(features))
+    ddos_features = ddos_scaler.transform(features)
+    web_prediction, ddos_prediction = web_model.predict(web_features)[0], ddos_model.predict(ddos_features)[0]
+    is_threat = (web_prediction == 1) or (ddos_prediction == -1)
+    if is_threat:
+        send_alert(packet[scapy.IP].src)
+        block_ip(packet[scapy.IP].src)
+        logging.info(f"Threat detected from {packet[scapy.IP].src}")
+
+# Block a suspicious IP address
+def block_ip(ip_address):
+    os.system(f"sudo iptables -A INPUT -s {ip_address} -j DROP") if os.name == "posix" else os.system(f"netsh advfirewall firewall add rule name='Block {ip_address}' dir=in action=block remoteip={ip_address}")
+    logging.info(f"Blocked IP: {ip_address}")
+
+# Send an alert when a threat is detected
+def send_alert(ip):
+    try:
+        requests.post("https://cloud-dashboard.example.com/alert", json={"source": ip, "status": "Threat detected"})
+    except requests.RequestException as e:
+        logging.error(f"Failed to send alert: {e}")
+
+# Main Execution
+web_data = load_web_datasets()
+ddos_files = ["DDOS attack-HOIC.csv", "DDOS attack-LOIC-UDP.csv", "DDoS attacks-LOIC-HTTP.csv"]
+ddos_data = load_ddos_datasets(ddos_files)
+dos_X, dos_y = load_dos_datasets()
+
+web_scaler, web_selector, web_model = train_web_model(web_data)
+ddos_scaler, ddos_model = train_ddos_model(ddos_data)
+dos_model = train_dos_model(dos_X, dos_y)
+
+print("Monitoring network traffic for threats...")
+scapy.sniff(prn=lambda pkt: analyze_packet(pkt, web_scaler, web_selector, web_model, ddos_scaler, ddos_model), store=False)
